@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Helmet Violation Detection</title>
+<style>
+  :root { --bg:#0f1115; --card:#181b22; --line:#2a2f3a; --txt:#e8eaf0; --mut:#9aa4b2; --acc:#2f6fed; --bad:#ff3b3b; --ok:#34c759; }
+  * { box-sizing:border-box; }
+  body { font-family:system-ui,sans-serif; background:var(--bg); color:var(--txt); margin:0; padding:16px; }
+  h1 { font-size:1.25rem; margin:0 0 12px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px; margin-bottom:14px; }
+  .row { display:flex; gap:14px; flex-wrap:wrap; align-items:center; }
+  .tabs button { background:var(--card); color:var(--txt); border:1px solid var(--line); padding:8px 16px; border-radius:8px; cursor:pointer; margin-right:6px; }
+  .tabs button.on { background:var(--acc); border-color:var(--acc); }
+  button.go { padding:8px 18px; border:0; border-radius:6px; background:var(--acc); color:#fff; cursor:pointer; font-size:1rem; }
+  button.stop { background:#d64545; }
+  .pane { display:none; } .pane.on { display:block; }
+  img.out, video.out { max-width:100%; border-radius:8px; margin-top:10px; }
+  .stage { position:relative; display:inline-block; max-width:100%; }
+  .stage video { max-width:100%; border-radius:8px; }
+  .stage canvas { position:absolute; left:0; top:0; width:100%; height:100%; pointer-events:none; }
+  .kpis { display:flex; gap:10px; flex-wrap:wrap; margin:10px 0; }
+  .kpi { background:#11141a; border:1px solid var(--line); border-radius:8px; padding:8px 14px; min-width:120px; }
+  .kpi b { display:block; font-size:1.3rem; } .kpi span { color:var(--mut); font-size:.8rem; }
+  .bad b { color:var(--bad); } .ok b { color:var(--ok); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(170px,1fr)); gap:10px; margin-top:10px; }
+  .ev { background:#11141a; border:1px solid var(--line); border-radius:8px; padding:6px; font-size:.8rem; }
+  .ev img { width:100%; border-radius:6px; display:block; margin-bottom:4px; }
+  .mut { color:var(--mut); font-size:.85rem; } a { color:#7aa7ff; }
+  #alert { display:none; background:var(--bad); color:#fff; padding:8px 12px; border-radius:8px; margin:8px 0; }
+</style>
+</head>
+<body>
+<h1>Helmet Violation Detection (YOLO + ByteTrack + FastAPI + SQLite)</h1>
+
+<div class="card row">
+  <label>Confidence <input id="conf" type="range" min="0.1" max="0.9" step="0.05" value="0.35"> <span id="confv">0.35</span></label>
+  <label>Size <select id="size"><option>320</option><option selected>416</option><option>640</option></select></label>
+  <a href="/docs" target="_blank">API docs</a>
+</div>
+
+<div class="tabs">
+  <button data-t="image" class="on">Image</button>
+  <button data-t="video">Video</button>
+  <button data-t="cam">Webcam</button>
+  <button data-t="log">Violation log</button>
+</div>
+
+<div id="image" class="pane on card">
+  <input type="file" id="imgFile" accept="image/*"> <button class="go" id="imgBtn">Check helmets</button>
+  <div id="imgOut"></div>
+</div>
+
+<div id="video" class="pane card">
+  <input type="file" id="vidFile" accept="video/*"> <button class="go" id="vidBtn">Detect &amp; track</button>
+  <div class="mut">Each rider gets an ID and is counted once. A violation is logged after the model sees "no_helmet" consistently for that rider.</div>
+  <div id="vidOut"></div>
+</div>
+
+<div id="cam" class="pane card">
+  <button class="go" id="camBtn">Start camera</button> <span id="camStats" class="mut">Idle</span>
+  <div id="alert"></div>
+  <div class="stage"><video id="cv" autoplay playsinline muted></video><canvas id="ov"></canvas></div>
+  <canvas id="grab" style="display:none"></canvas>
+</div>
+
+<div id="log" class="pane card">
+  <button class="go" id="refresh">Refresh</button> <button class="go stop" id="clear">Clear history</button>
+  <div id="kpis" class="kpis"></div>
+  <div id="events" class="grid"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const j = async (url, opt) => { const r = await fetch(url, opt); const d = await r.json().catch(() => ({})); if (!r.ok) throw new Error(d.detail || r.statusText); return d; };
+const q = () => `conf=${$("#conf").value}&imgsz=${$("#size").value}`;
+const kpi = (v, l, cls = "") => `<div class="kpi ${cls}"><b>${v}</b><span>${l}</span></div>`;
+const pct = x => x == null ? "-" : Math.round(x * 100) + "%";
+const evCards = evs => evs.length ? evs.map(e => `<div class="ev">${e.snapshot_url ? `<img src="${e.snapshot_url}">` : ""}Run #${e.run_id} ${e.track_id != null ? "· ID " + e.track_id : ""}<br>conf ${(e.confidence ?? 0).toFixed(2)} · t=${e.t_sec ?? 0}s</div>`).join("") : "<p class='mut'>No violations logged.</p>";
+
+document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
+  document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll(".pane").forEach(p => p.classList.toggle("on", p.id === b.dataset.t));
+  if (b.dataset.t === "log") loadLog();
+});
+$("#conf").oninput = () => { $("#confv").textContent = (+$("#conf").value).toFixed(2); sendCfg(); };
+$("#size").onchange = sendCfg;
+
+$("#imgBtn").onclick = async () => {
+  const f = $("#imgFile").files[0]; if (!f) return alert("Choose an image first");
+  $("#imgOut").innerHTML = "<p class='mut'>Checking...</p>";
+  try {
+    const fd = new FormData(); fd.append("file", f);
+    const d = await j(`/api/detect/image?${q()}`, { method: "POST", body: fd });
+    $("#imgOut").innerHTML = `<div class="kpis">${kpi(d.riders, "riders / heads")}${kpi(d.violations, "no helmet", d.violations ? "bad" : "")}${kpi(d.compliant, "with helmet", "ok")}${kpi(d.processing_ms + " ms", "inference")}</div>`
+      + `<img class="out" src="${d.image_url}"><br><a href="${d.image_url}" download>Download result</a>`;
+  } catch (e) { $("#imgOut").innerHTML = `<p style="color:#ff7b7b">${e.message}</p>`; }
+};
+
+$("#vidBtn").onclick = async () => {
+  const f = $("#vidFile").files[0]; if (!f) return alert("Choose a video first");
+  $("#vidBtn").disabled = true; $("#vidOut").innerHTML = "<p class='mut'>Uploading and tracking... please wait.</p>";
+  try {
+    const fd = new FormData(); fd.append("file", f);
+    const d = await j(`/api/detect/video?${q()}`, { method: "POST", body: fd });
+    $("#vidOut").innerHTML = `<div class="kpis">${kpi(d.riders, "riders tracked")}${kpi(d.violations, "violations", d.violations ? "bad" : "")}${kpi(pct(d.compliance_rate), "helmet compliance", "ok")}${kpi(d.frames, "frames")}${kpi(d.fps, "FPS")}</div>`
+      + `<video class="out" src="${d.video_url}" controls></video><br><a href="${d.video_url}" download>Download tracked video</a>`
+      + `<h3>Logged violations</h3><div class="grid">${evCards(d.events.map(e => ({ ...e, run_id: d.run_id })))}</div>`;
+  } catch (e) { $("#vidOut").innerHTML = `<p style="color:#ff7b7b">${e.message}</p>`; }
+  $("#vidBtn").disabled = false;
+};
+
+let ws = null, stream = null, running = false, inflight = false, frames = 0, tStart = 0;
+const cv = $("#cv"), ov = $("#ov"), octx = ov.getContext("2d"), grab = $("#grab"), gctx = grab.getContext("2d");
+function sendCfg() { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ conf: +$("#conf").value, imgsz: +$("#size").value })); }
+async function camStart() {
+  stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false });
+  cv.srcObject = stream; await cv.play();
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws`);
+  ws.onopen = () => { sendCfg(); running = true; frames = 0; tStart = performance.now(); loop(); };
+  ws.onmessage = e => { inflight = false; draw(JSON.parse(e.data)); };
+  ws.onclose = () => { if (running) camStop(); };
+  $("#camBtn").textContent = "Stop"; $("#camBtn").classList.add("stop");
+}
+function camStop() {
+  running = false; inflight = false;
+  if (ws) ws.close();
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  octx.clearRect(0, 0, ov.width, ov.height);
+  $("#camBtn").textContent = "Start camera"; $("#camBtn").classList.remove("stop"); $("#camStats").textContent = "Stopped (session saved to the log)";
+}
+function loop() {
+  if (!running) return;
+  if (!inflight && ws.readyState === 1 && cv.videoWidth) {
+    const W = 416, H = Math.round(W * cv.videoHeight / cv.videoWidth);
+    grab.width = W; grab.height = H; gctx.drawImage(cv, 0, 0, W, H); inflight = true;
+    grab.toBlob(b => b && b.arrayBuffer().then(buf => ws.send(buf)), "image/jpeg", 0.6);
+  }
+  requestAnimationFrame(loop);
+}
+function draw(res) {
+  ov.width = cv.videoWidth; ov.height = cv.videoHeight;
+  const sx = ov.width / res.w, sy = ov.height / res.h;
+  octx.lineWidth = Math.max(2, ov.width / 300); octx.font = `${Math.max(14, ov.width / 40)}px sans-serif`;
+  res.detections.forEach(d => {
+    const [x1, y1, x2, y2] = d.box_xyxy, bad = d.class === "no_helmet", c = bad ? "#ff3b3b" : "#34c759";
+    octx.strokeStyle = c; octx.fillStyle = c; octx.strokeRect(x1*sx, y1*sy, (x2-x1)*sx, (y2-y1)*sy);
+    const label = `${d.id != null ? "#" + d.id + " " : ""}${d.class} ${(d.confidence*100).toFixed(0)}%`, tw = octx.measureText(label).width + 8;
+    octx.fillRect(x1*sx, y1*sy - 22, tw, 22); octx.fillStyle = "#fff"; octx.fillText(label, x1*sx + 4, y1*sy - 5);
+  });
+  frames++;
+  const s = res.summary;
+  $("#camStats").textContent = `${(frames / ((performance.now() - tStart) / 1000)).toFixed(1)} FPS | server ${res.ms} ms | riders ${s.riders} | violations ${s.violations}`;
+  if (res.new_violations) { const a = $("#alert"); a.style.display = "block"; a.textContent = `Violation logged (total ${s.violations})`; setTimeout(() => a.style.display = "none", 2500); }
+}
+$("#camBtn").onclick = () => running ? camStop() : camStart().catch(e => { alert("Camera/WebSocket error: " + e.message); camStop(); });
+
+async function loadLog() {
+  const [st, evs] = await Promise.all([j("/api/stats"), j("/api/events?limit=60")]);
+  $("#kpis").innerHTML = kpi(st.runs, "runs") + kpi(st.violations, "violations logged", st.violations ? "bad" : "") + kpi(st.riders, "riders checked") + kpi(pct(st.compliance_rate), "helmet compliance", "ok");
+  $("#events").innerHTML = evCards(evs);
+}
+$("#refresh").onclick = loadLog;
+$("#clear").onclick = async () => { if (confirm("Delete all history, snapshots and results?")) { await j("/api/history", { method: "DELETE" }); loadLog(); } };
+</script>
+</body>
+</html>
